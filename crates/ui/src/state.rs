@@ -668,12 +668,60 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
 /// A composer send whose doc command is queued but not yet executed by the
 /// chat's host device — cleared when the host writes the user message back
 /// into the transcript (same client-minted id as the [`AppState::echoes`]
-/// dedup); past [`UNDELIVERED_GRACE_MS`] it surfaces as the explicit
-/// failed/retry state instead.
+/// dedup), or, for a chat that isn't open, when its session row shows the
+/// turn that runs it; past [`UNDELIVERED_GRACE_MS`] it surfaces as the
+/// explicit failed/retry state instead.
 #[derive(Debug, Clone)]
 struct PendingSend {
     message_id: String,
     started: DateTime<Utc>,
+    /// The chat's session row when the send began; `None` if it had none.
+    row_before: Option<Session>,
+    /// The send creates the chat, so no earlier turn of it exists.
+    new_chat: bool,
+}
+
+impl PendingSend {
+    /// Whether `session`, the chat's row now, shows its host took this send.
+    /// The transcript names the message but is watched for the selected chat
+    /// only: a session left before its message landed read "Failed" 120 s
+    /// later, mid-run (user report 2026-10-26). A row shows turns, not
+    /// messages. A chat with no live run takes a send rather than queueing
+    /// it, and its host writes the message, then starts a turn, so the next
+    /// turn to start (or to end between two frames) is taken for the send's.
+    /// A turn started there first, from another device or a session its host
+    /// resumes after a restart, passes for it too.
+    ///
+    /// No earlier turn's result may count: it would ring the done chime a
+    /// pending send keeps quiet (d3141ef0). Hence no stale row, no live row
+    /// with a completion the send has not seen, no settled row when a turn
+    /// was in flight at send time, no outcome older than the send, and no
+    /// interrupted one, which a restart stamps on the turn it cut off. A
+    /// restarted host, or a Cloud machine waking, comes back with no
+    /// completion at all, which counts.
+    fn adopted_by(&self, session: &Session, now: DateTime<Utc>) -> bool {
+        use zeron_proto::SessionStatus::{AwaitingInput, Errored, Idle, Working};
+        let before = self.row_before.as_ref();
+        let settled_before = before.map_or(self.new_chat, |b| matches!(b.status, Idle | Errored));
+        match session.status {
+            Working | AwaitingInput => {
+                let completed_before = before.and_then(|b| b.last_completed_turn.as_ref());
+                !zeron_proto::view::session_stale(session, now)
+                    && session.started_at.is_some()
+                    && session.started_at != before.and_then(|b| b.started_at)
+                    && (session.last_completed_turn.as_ref() == completed_before
+                        || session.last_completed_turn.is_none() && settled_before)
+            }
+            Idle | Errored => {
+                settled_before
+                    && session.last_turn_outcome.is_some_and(|o| {
+                        o.status != zeron_proto::DoneStatus::Interrupted
+                            && o.finished_at > self.started
+                    })
+                    && session.last_turn_outcome != before.and_then(|b| b.last_turn_outcome)
+            }
+        }
+    }
 }
 
 /// How long an unadopted send reads as Working/Sending (or Queued when the
@@ -1317,7 +1365,26 @@ impl AppState {
         self.session_presentation = Some(presentation);
         self.session_presence_presentation = presence;
         self.sessions = sessions;
-        changed
+        let adopted = self.adopt_pending_sends(now);
+        changed || adopted
+    }
+
+    /// Clears the pending send of each chat but the open one whose row shows
+    /// the turn that runs it ([`PendingSend::adopted_by`]); the open chat's
+    /// transcript names the message, so only it acks there. Returns whether
+    /// one was cleared.
+    fn adopt_pending_sends(&mut self, now: DateTime<Utc>) -> bool {
+        let pending = self.pending_sends.len();
+        let selected = self.selected_chat.as_deref();
+        let sessions = &self.sessions;
+        self.pending_sends.retain(|chat_id, send| {
+            selected == Some(chat_id.as_str())
+                || !sessions
+                    .iter()
+                    .find(|s| s.chat_id == *chat_id)
+                    .is_some_and(|s| send.adopted_by(s, now))
+        });
+        self.pending_sends.len() != pending
     }
 
     /// Returns whether the list or the healed selection changed.
@@ -1968,17 +2035,30 @@ impl AppState {
     }
 
     /// Composer send fired: overlay the chat as Working until the host writes
-    /// the user message back into the transcript (or the TTL lapses). A remote
+    /// the user message back into the transcript or its session row shows the
+    /// turn that runs it ([`PendingSend::adopted_by`]). A remote
     /// send has no live session row until the host drains the queued command —
     /// that gap read as "no live run" and flashed the Completed dot, and any
     /// phantom Working→Idle edge in it rang the done-chime on send (user
     /// report 2026-08-05).
     pub fn begin_pending_send(&mut self, chat_id: &str, message_id: &str, now: DateTime<Utc>) {
+        self.begin_send(chat_id, message_id, false, now);
+    }
+
+    /// [`Self::begin_pending_send`] for the send that creates its chat.
+    pub fn begin_first_send(&mut self, chat_id: &str, message_id: &str, now: DateTime<Utc>) {
+        self.begin_send(chat_id, message_id, true, now);
+    }
+
+    fn begin_send(&mut self, chat_id: &str, message_id: &str, new_chat: bool, now: DateTime<Utc>) {
+        let row_before = self.session_for(chat_id).cloned();
         self.pending_sends.insert(
             chat_id.to_string(),
             PendingSend {
                 message_id: message_id.to_string(),
                 started: now,
+                row_before,
+                new_chat,
             },
         );
     }
@@ -3918,6 +3998,9 @@ impl AppState {
             }
         }
         self.selected_chat = chat_id.clone();
+        // The chat left no longer acks its send from its transcript, and its
+        // row may already show the turn that runs it.
+        self.adopt_pending_sends(Utc::now());
         self.auto_selected = true;
         self.transcript.clear();
         self.context_usage = None;
@@ -4621,7 +4704,7 @@ mod tests {
     use zeron_rpc::RpcReply;
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `zeron_proto::view`.
-    use zeron_proto::{SessionStatus, UserProfile};
+    use zeron_proto::{DoneStatus, SessionStatus, UserProfile};
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
@@ -5727,6 +5810,328 @@ mod tests {
         );
         assert_eq!(s.indicator_for("c", later), Indicator::None);
         assert!(s.send_undelivered("c", later));
+    }
+
+    /// A row of `chat_id` in `status`, its turn started at `started_at` and
+    /// heartbeating at `at`.
+    fn turn(
+        chat_id: &str,
+        status: SessionStatus,
+        started_at: Option<DateTime<Utc>>,
+        at: DateTime<Utc>,
+    ) -> Session {
+        Session {
+            started_at,
+            ..session(chat_id, status, 0, at)
+        }
+    }
+
+    fn outcome(status: DoneStatus, finished_at: DateTime<Utc>) -> zeron_proto::NativeTurnOutcome {
+        zeron_proto::NativeTurnOutcome {
+            status,
+            finished_at,
+        }
+    }
+
+    /// The row of a turn that ended at `at` with `status`, settled the way
+    /// the engine settles it; `completed` is the chat's completion marker.
+    fn ended(
+        chat_id: &str,
+        status: DoneStatus,
+        completed: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Session {
+        let settled = match status {
+            DoneStatus::Errored => SessionStatus::Errored,
+            _ => SessionStatus::Idle,
+        };
+        Session {
+            last_completed_turn: completed.map(Into::into),
+            last_turn_outcome: Some(outcome(status, at)),
+            ..turn(chat_id, settled, None, at)
+        }
+    }
+
+    /// The shell's chime for `row`, the frame after `prev`.
+    fn chime(
+        s: &AppState,
+        prev: &Session,
+        row: &Session,
+        now: DateTime<Utc>,
+    ) -> Option<crate::sound::Ping> {
+        crate::sound::SessionNotificationState::new(row, now).ping_since(
+            &crate::sound::SessionNotificationState::new(prev, prev.updated_at),
+            s.send_pending(&row.chat_id, now),
+        )
+    }
+
+    #[test]
+    fn a_send_left_before_it_landed_is_adopted_by_the_turn_its_host_starts() {
+        // User report 2026-10-26: sessions launched back to back, each left
+        // for the next before its host wrote the message (a fresh worktree is
+        // checked out first). Only the selected chat's transcript acked a
+        // send, so 120 s later the sidebar painted live runs "Failed".
+        let sent = Utc::now();
+        let t = |secs: i64| sent + TimeDelta::seconds(secs);
+        let mut s = AppState::new();
+        s.selected_chat = Some("new".into());
+        s.begin_first_send("new", "m1", sent);
+        s.selected_chat = None; // Cmd+N: the next session's canvas
+        let new = chat("new", 0, Some(1));
+
+        let running = turn("new", SessionStatus::Working, Some(t(2)), t(2));
+        assert!(s.apply_sessions_at(vec![running.clone()], t(2)));
+        assert!(!s.send_pending("new", t(2)));
+        assert_eq!(s.display_status_for(&new, t(2)), ChatIndicator::Working);
+
+        // It finishes inside the grace window: Done, with its chime.
+        let done = ended("new", DoneStatus::Completed, Some("t1"), t(40));
+        s.apply_sessions_at(vec![done.clone()], t(40));
+        assert_eq!(s.display_status_for(&new, t(40)), ChatIndicator::Completed);
+        assert_eq!(chime(&s, &running, &done, t(40)), Some(crate::sound::Ping::Done));
+        assert!(!s.send_undelivered("new", t(121)));
+    }
+
+    #[test]
+    fn a_send_whose_turn_asks_a_question_reads_as_input() {
+        let sent = Utc::now();
+        let at = sent + TimeDelta::seconds(3);
+        let mut s = AppState::new();
+        s.begin_first_send("q", "m1", sent);
+        // Started and parked on its question between two frames.
+        let asking = turn("q", SessionStatus::AwaitingInput, Some(at), at);
+        s.apply_sessions_at(vec![asking], at);
+        let q = chat("q", 0, None);
+        assert_eq!(s.display_status_for(&q, at), ChatIndicator::AwaitingInput);
+        let later = sent + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        assert!(!s.send_undelivered("q", later));
+    }
+
+    #[test]
+    fn only_a_fresh_turn_started_after_the_send_adopts_it() {
+        let sent = Utc::now();
+        let t = |secs: i64| sent + TimeDelta::seconds(secs);
+        // The previous turn's row has gone stale, so the chat took a send.
+        let previous = Session {
+            last_completed_turn: Some("t0".into()),
+            ..turn("a", SessionStatus::Working, Some(t(-600)), t(-60))
+        };
+        let mut s = AppState::new();
+        s.apply_sessions_at(vec![previous.clone()], sent);
+        s.begin_pending_send("a", "m1", sent);
+        let pending_after = |s: &mut AppState, row: Session, now| {
+            s.apply_sessions_at(vec![row], now);
+            s.send_pending("a", now)
+        };
+
+        // That turn's heartbeat resumes.
+        let heartbeat = Session {
+            updated_at: t(5),
+            ..previous.clone()
+        };
+        assert!(pending_after(&mut s, heartbeat, t(5)));
+        // A turn on a row nobody has refreshed since.
+        let stale = Session {
+            started_at: Some(t(6)),
+            updated_at: t(6),
+            ..previous.clone()
+        };
+        assert!(pending_after(&mut s, stale, t(60)));
+        // A live row with no turn start at all (a peer that sends none).
+        let unstamped = Session {
+            started_at: None,
+            updated_at: t(60),
+            ..previous.clone()
+        };
+        assert!(pending_after(&mut s, unstamped, t(60)));
+        // That turn's end: no new turn to show.
+        let stopped = ended("a", DoneStatus::Interrupted, Some("t0"), t(61));
+        assert!(pending_after(&mut s, stopped, t(61)));
+        // Another chat's turn.
+        let other = turn("b", SessionStatus::Working, Some(t(62)), t(62));
+        assert!(pending_after(&mut s, other, t(62)));
+
+        let adopted = Session {
+            started_at: Some(t(63)),
+            updated_at: t(63),
+            ..previous
+        };
+        assert!(!pending_after(&mut s, adopted, t(63)));
+    }
+
+    #[test]
+    fn a_late_result_of_an_earlier_turn_never_adopts_a_send() {
+        // d3141ef0: completions stay quiet while a send is pending, and the
+        // result of a turn that ran before the send proves nothing about it.
+        let sent = Utc::now();
+        let t = |secs: i64| sent + TimeDelta::seconds(secs);
+        // A turn in flight at send time (its row had gone stale) ends, alone
+        // or with the next turn's start in one coalesced frame.
+        let previous = Session {
+            last_completed_turn: Some("t0".into()),
+            ..turn("a", SessionStatus::Working, Some(t(-600)), t(-60))
+        };
+        let next = Session {
+            last_completed_turn: Some("t1".into()),
+            ..turn("a", SessionStatus::Working, Some(t(3)), t(3))
+        };
+        // A settled row that lagged: a turn it never showed had already ended.
+        let idle = ended("a", DoneStatus::Completed, Some("t0"), t(-3600));
+        let caught_up = ended("a", DoneStatus::Completed, Some("t1"), t(-5));
+        for (before, row) in [
+            (&previous, ended("a", DoneStatus::Completed, Some("t1"), t(2))),
+            (&previous, next),
+            (&idle, caught_up),
+        ] {
+            let mut s = AppState::new();
+            s.apply_sessions_at(vec![before.clone()], sent);
+            s.begin_pending_send("a", "m1", sent);
+            s.apply_sessions_at(vec![row.clone()], t(3));
+            assert!(s.send_pending("a", t(3)), "{row:?}");
+            assert_eq!(chime(&s, before, &row, t(3)), None, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_turn_that_ends_between_two_frames_adopts_a_send_it_could_only_be() {
+        let sent = Utc::now();
+        let at = sent + TimeDelta::seconds(2);
+        let later = sent + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        // A new chat's first row already has its turn over.
+        let new = chat("new", 0, Some(1));
+        for (status, completed, shown) in [
+            (DoneStatus::Completed, Some("t1"), ChatIndicator::Completed),
+            (DoneStatus::Errored, None, ChatIndicator::Errored),
+        ] {
+            let mut s = AppState::new();
+            s.begin_first_send("new", "m1", sent);
+            s.apply_sessions_at(vec![ended("new", status, completed, at)], at);
+            assert!(!s.send_pending("new", at), "{status:?}");
+            assert_eq!(s.display_status_for(&new, at), shown);
+            assert!(!s.send_undelivered("new", later), "{status:?}");
+        }
+
+        // A settled chat's next turn: after a completed turn, a failed one, or
+        // one stamped by a host whose clock runs ahead of this device's.
+        let finished = ended("a", DoneStatus::Completed, Some("t0"), sent - TimeDelta::hours(1));
+        let failed = ended("a", DoneStatus::Errored, Some("t0"), sent - TimeDelta::hours(1));
+        let ahead = ended("a", DoneStatus::Completed, Some("t0"), sent + TimeDelta::seconds(1));
+        for before in [finished, failed, ahead] {
+            let mut s = AppState::new();
+            s.apply_sessions_at(vec![before.clone()], sent);
+            s.begin_pending_send("a", "m1", sent);
+            // The same row again, a restarted host's empty one, or a Stop,
+            // ends no turn of the send's.
+            let empty = Session {
+                last_completed_turn: None,
+                last_turn_outcome: None,
+                ..before.clone()
+            };
+            let stopped = ended("a", DoneStatus::Interrupted, Some("t0"), at);
+            for row in [before.clone(), empty, stopped] {
+                s.apply_sessions_at(vec![row.clone()], at);
+                assert!(s.send_pending("a", at), "{row:?}");
+            }
+            s.apply_sessions_at(vec![ended("a", DoneStatus::Completed, Some("t1"), at)], at);
+            assert!(!s.send_pending("a", at), "{before:?}");
+        }
+    }
+
+    #[test]
+    fn a_restarted_host_adopts_with_no_completion_but_not_on_its_recovery() {
+        // A host engine restart (a Cloud machine waking, too) starts its rows
+        // over: the send's turn comes back with no completion marker at all,
+        // after a finished turn or a stopped one.
+        let sent = Utc::now();
+        let t = |secs: i64| sent + TimeDelta::seconds(secs);
+        let first = turn("a", SessionStatus::Working, Some(t(5)), t(5));
+        for before in [
+            ended("a", DoneStatus::Completed, Some("t0"), t(-3600)),
+            ended("a", DoneStatus::Interrupted, Some("t0"), t(-3600)),
+        ] {
+            let mut s = AppState::new();
+            s.apply_sessions_at(vec![before.clone()], sent);
+            s.begin_pending_send("a", "m1", sent);
+            // Boot recovery settles a turn the restart cut off, which ran
+            // nothing of the send's.
+            s.apply_sessions_at(vec![ended("a", DoneStatus::Interrupted, None, t(4))], t(4));
+            assert!(s.send_pending("a", t(4)), "{before:?}");
+            s.apply_sessions_at(vec![first.clone()], t(5));
+            assert!(!s.send_pending("a", t(5)), "{before:?}");
+        }
+
+        // A turn in flight at send time (its row had gone stale), which the
+        // restart cut off, resumes first.
+        let previous = Session {
+            last_completed_turn: Some("t0".into()),
+            ..turn("a", SessionStatus::Working, Some(t(-600)), t(-60))
+        };
+        let mut s = AppState::new();
+        s.apply_sessions_at(vec![previous], sent);
+        s.begin_pending_send("a", "m1", sent);
+        s.apply_sessions_at(vec![first], t(5));
+        assert!(s.send_pending("a", t(5)));
+    }
+
+    #[test]
+    fn the_open_chat_keeps_its_exact_ack_and_leaving_hands_it_to_the_row() {
+        let sent = Utc::now();
+        let t = |secs: i64| sent + TimeDelta::seconds(secs);
+        let mut s = AppState::new();
+        s.selected_chat = Some("a".into());
+        s.begin_first_send("a", "m1", sent);
+        // Its transcript names the message; the row only shows a turn.
+        let asking = turn("a", SessionStatus::AwaitingInput, Some(t(2)), t(2));
+        s.apply_sessions_at(vec![asking.clone()], t(2));
+        assert!(s.send_pending("a", t(2)));
+        // Left: the next frame, though it looks the same, adopts and repaints.
+        s.selected_chat = Some("b".into());
+        let heartbeat = Session {
+            updated_at: t(12),
+            ..asking
+        };
+        assert!(s.apply_sessions_at(vec![heartbeat], t(12)));
+        assert!(!s.send_pending("a", t(12)));
+    }
+
+    #[gpui::test]
+    fn leaving_a_chat_hands_its_send_to_the_row_it_already_has(cx: &mut gpui::TestAppContext) {
+        // Its turn ended while it was open, before the transcript named the
+        // message, and nothing else is live: no frame follows the user out.
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |s, cx| {
+            let sent = Utc::now() - TimeDelta::seconds(10);
+            let at = sent + TimeDelta::seconds(5);
+            s.select_chat(Some("a".into()), cx);
+            s.begin_first_send("a", "m1", sent);
+            s.apply_sessions_at(vec![ended("a", DoneStatus::Completed, Some("t1"), at)], at);
+            assert!(s.send_pending("a", at));
+            s.select_chat(Some("b".into()), cx);
+            assert!(!s.send_pending("a", Utc::now()));
+        });
+    }
+
+    #[test]
+    fn a_known_chat_whose_row_arrives_after_the_send_proves_nothing() {
+        // Its first row may end a turn that was running as the user sent.
+        let sent = Utc::now();
+        let at = sent + TimeDelta::seconds(2);
+        let mut s = AppState::new();
+        s.begin_pending_send("a", "m1", sent);
+        let old = ended("a", DoneStatus::Completed, Some("t0"), at);
+        s.apply_sessions_at(vec![old], at);
+        assert!(s.send_pending("a", at));
+    }
+
+    #[test]
+    fn a_send_no_host_takes_still_fails_past_the_grace() {
+        let sent = Utc::now();
+        let later = sent + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        let mut s = AppState::new();
+        s.begin_first_send("a", "m1", sent);
+        let other = turn("b", SessionStatus::Working, Some(later), later);
+        s.apply_sessions_at(vec![other], later);
+        assert!(s.send_undelivered("a", later));
     }
 
     #[gpui::test]

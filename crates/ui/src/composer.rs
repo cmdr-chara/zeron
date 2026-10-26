@@ -9118,6 +9118,7 @@ impl Composer {
         }
         // A queued message is not in the transcript yet — the queue panel is
         // its echo, and it gets a real bubble when the host sends it.
+        let creates_chat = is_new || create_side_chat.is_some();
         let cloud_boot = self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
@@ -9136,7 +9137,11 @@ impl Composer {
                 // Working overlay until the host executes the queued command —
                 // without it a remote send flashed Completed (and could ring
                 // the done-chime) in the queue→drain→sync gap.
-                s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
+                if creates_chat {
+                    s.begin_first_send(&chat_id, &message_id, chrono::Utc::now());
+                } else {
+                    s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
+                }
                 // A Cloud chat's machine may be starting or asleep: read
                 // where it stands (and follow it until it is up) — and
                 // whether credits allow it to, which can have changed since
