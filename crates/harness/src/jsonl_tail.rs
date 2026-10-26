@@ -40,12 +40,19 @@ impl TailReader {
         self.offset += read as u64;
         self.carry.extend_from_slice(&bytes);
         let mut entries = Vec::new();
-        while let Some(nl) = self.carry.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.carry.drain(..=nl).collect();
-            if let Ok(v) = serde_json::from_slice::<Value>(&line) {
+        let mut consumed = 0;
+        for (index, byte) in self.carry.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_slice::<Value>(&self.carry[consumed..index]) {
                 entries.push(v);
             }
+            consumed = index + 1;
         }
+        // Shift only the incomplete suffix, once per read rather than once
+        // per record. A backlog of short lines must remain linear work.
+        self.carry.drain(..consumed);
         entries
     }
 }
@@ -70,6 +77,27 @@ mod tests {
         assert!(tail.read_new().is_empty());
         write!(file, "2}}\n{{\"n\":3}}\n").unwrap();
         assert_eq!(tail.read_new(), [json!({"n": 2}), json!({"n": 3})]);
+        assert!(tail.read_new().is_empty());
+    }
+
+    #[test]
+    fn a_large_backlog_preserves_order_and_a_partial_utf8_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backlog.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for n in 0..20_000 {
+            writeln!(file, "{{\"n\":{n}}}").unwrap();
+        }
+        file.write_all(b"{\"text\":\"\xe2\x82").unwrap();
+        let mut tail = TailReader::new(path);
+        let entries = tail.read_new();
+        assert_eq!(entries.len(), 20_000);
+        for (n, entry) in entries.iter().enumerate() {
+            assert_eq!(*entry, json!({"n": n}));
+        }
+        assert!(tail.read_new().is_empty());
+        file.write_all(b"\xac\"}\n").unwrap();
+        assert_eq!(tail.read_new(), [json!({"text": "€"})]);
         assert!(tail.read_new().is_empty());
     }
 }

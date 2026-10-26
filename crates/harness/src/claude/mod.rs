@@ -1209,6 +1209,7 @@ async fn run_session(session: Session) {
             None => tail = None,
         }
         let tail_at = tail.as_ref().and_then(ForkTail::next_read);
+        let tail_reading = tail.as_ref().is_some_and(ForkTail::is_reading);
         tokio::select! {
             line = stdout_lines.next_line() => match line {
                 Ok(Some(line)) => {
@@ -1435,10 +1436,17 @@ async fn run_session(session: Session) {
                 }
             },
 
-            // The typed fork's records, as it writes them.
+            // Disk work never occupies this loop: stdout, Stop and steering
+            // keep flowing even when the transcript is on slow storage.
             _ = tokio::time::sleep_until(tail_at.unwrap_or_else(tokio::time::Instant::now)),
                 if tail_at.is_some() => {
-                let records = tail.as_mut().map_or_else(Vec::new, ForkTail::read);
+                if let Some(tail) = tail.as_mut() {
+                    tail.start_read();
+                }
+            },
+
+            records = async { tail.as_mut().expect("read in flight").read_done().await },
+                if tail_reading => {
                 for ev in records.into_iter().flat_map(|record| norm.fork_record(record)) {
                     if event_tx.send(Ok(ev)).await.is_err() {
                         break 'main;
