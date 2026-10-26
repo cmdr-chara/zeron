@@ -69,21 +69,29 @@ def main():
         "base_modifications": sorted(expected | {"crates/ui/examples/remote-sync-fixture.rs"}),
         "scenario": "Production Shell and real isolated engine; scripted host/connectivity. No real remote host.",
         "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
-        "captures": {}, "complete": False,
+        "captures": {}, "executables": {}, "complete": False,
     }
     record = output / "provenance.json"
     record.write_text(json.dumps(provenance, indent=2) + "\n")
     try:
         for label, tree in trees.items():
-            target = Path(os.environ["CARGO_TARGET_DIR"])
+            # Cargo can reuse a path dependency built from another checkout when
+            # both worktrees share a target directory. Keep each build isolated.
+            target = Path(os.environ["CARGO_TARGET_DIR"]) / label
+            build_env = dict(os.environ, CARGO_TARGET_DIR=str(target))
             with (output / f"{label}-build.log").open("w") as log:
                 subprocess.run(["cargo", "build", "--locked", "-p", "zeron-ui", "--features",
                                 "appshots-fixture", "--example", "remote-sync-fixture"],
-                               cwd=tree, stdout=log, stderr=subprocess.STDOUT, check=True)
+                               cwd=tree, env=build_env, stdout=log,
+                               stderr=subprocess.STDOUT, check=True)
             destination = output / label
             executable = destination / "Fixture.app/Contents/MacOS/fixture"
             executable.parent.mkdir(parents=True)
             shutil.copy2(target / "debug/examples/remote-sync-fixture", executable)
+            provenance["executables"][label] = hashlib.sha256(executable.read_bytes()).hexdigest()
+            if label == "head":
+                assert provenance["executables"]["base"] != provenance["executables"]["head"], \
+                    "base and head executables unexpectedly match"
             info = plistlib.loads((tree / "dist/macos/Info.plist").read_bytes().replace(
                 b"__VERSION__", b"1.0.0"))
             info["CFBundleExecutable"] = "fixture"
