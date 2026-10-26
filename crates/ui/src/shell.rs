@@ -103,17 +103,24 @@ use voice_stage::VOICE_STAGE_ORB_SCALE;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
-/// `connected` already includes the engine's degradation grace. A brief
-/// focus-triggered dial needs no sidebar status; queued changes or a sustained
-/// outage still deserve one.
-fn chat_sync_pill_caption(chat: &zeron_proto::ChatConnectivity) -> Option<&'static str> {
-    use zeron_proto::ChatSyncState as S;
-    let sustained_or_queued = !chat.connected || chat.pending_pushes > 0;
-    match chat.sync_state {
-        S::Waiting if sustained_or_queued => Some("Sync queued — changes are saved"),
-        S::Connecting if sustained_or_queued => Some("Syncing…"),
-        S::Offline if !chat.connected => Some("Offline — changes are saved"),
-        _ => None,
+/// The sidebar line speaks for the whole connection, and whether its glyph
+/// is the amber dot (else the reconnect spinner). One chat's sync reads in
+/// its own composer and transcript, so the two never tell different
+/// stories. A failed local save is the exception, whichever chat it hit:
+/// it outranks the network.
+fn connection_pill_caption(conn: &zeron_proto::Connectivity) -> Option<(&'static str, bool)> {
+    use zeron_proto::{ChatSyncState, ConnectivityState as S};
+    if conn
+        .chats
+        .iter()
+        .any(|chat| chat.sync_state == ChatSyncState::StorageError)
+    {
+        return Some(("Changes could not be saved", true));
+    }
+    match conn.state {
+        S::Disabled | S::Connected => None,
+        S::Offline => Some(("Offline — sends are saved", true)),
+        S::Reconnecting => Some(("Reconnecting…", false)),
     }
 }
 
@@ -2087,7 +2094,6 @@ pub struct Shell {
     subagent_seq: u64,
     side_chats: std::collections::HashMap<u64, SideChatTab>,
     side_chat_seq: u64,
-    side_chat_creating: bool,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
@@ -2649,7 +2655,6 @@ impl Shell {
             subagent_seq: 0,
             side_chats: std::collections::HashMap::new(),
             side_chat_seq: 0,
-            side_chat_creating: false,
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
@@ -2909,7 +2914,6 @@ impl Shell {
         self.sync_search_warm(cx);
         if state.read(cx).engine().is_none() {
             self.side_chats.clear();
-            self.side_chat_creating = false;
         }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.show_notice(crate::toast::ToastKind::Info, notice, cx);
@@ -9568,64 +9572,29 @@ impl Shell {
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
-    /// Global connection health, with selected-chat queue and storage status.
-    /// Persistence failures take precedence even when the network is offline.
-    /// No surface,
+    /// Global connection health and any chat's storage failure (see
+    /// [`connection_pill_caption`]). No surface,
     /// no border (v0.2.12 feedback): a bare spinner + faint caption while
     /// reconnecting; an amber dot only when the OS says offline. The
     /// transport error belongs in logs, not the sidebar.
     fn render_connection_pill(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use zeron_proto::ConnectivityState as S;
-        let conn = self.state.read(cx).connectivity.clone();
-        let selected = self.state.read(cx).selected_chat.as_deref();
-        let chat = conn
-            .chats
-            .iter()
-            .find(|c| Some(c.chat_id.as_str()) == selected);
-        let chat_state = chat.map(|c| c.sync_state);
-        let (label, glyph): (SharedString, AnyElement) = match conn.state {
-            _ if chat_state == Some(zeron_proto::ChatSyncState::StorageError) => (
-                "Changes could not be saved".into(),
-                div()
-                    .size(px(5.0))
-                    .rounded_full()
-                    .bg(theme.warning)
-                    .into_any_element(),
-            ),
-            S::Disabled => return None,
-            S::Connected => {
-                let caption = chat_sync_pill_caption(chat?)?;
-                (
-                    caption.into(),
-                    loaders::mini_mono_spinner(
-                        "chat-sync-spinner",
-                        2.0,
-                        theme.text_muted,
-                        self.sidebar_pane.entity_id(),
-                        cx,
-                    )
-                    .into_any_element(),
-                )
-            }
-            S::Offline => (
-                "Offline — sends are saved".into(),
-                div()
-                    .size(px(5.0))
-                    .rounded_full()
-                    .bg(theme.warning)
-                    .into_any_element(),
-            ),
-            S::Reconnecting => (
-                "Reconnecting…".into(),
-                loaders::mini_mono_spinner(
-                    "connection-spinner",
-                    2.0,
-                    theme.text_muted,
-                    self.sidebar_pane.entity_id(),
-                    cx,
-                )
-                .into_any_element(),
-            ),
+        let (caption, warning) = connection_pill_caption(&self.state.read(cx).connectivity)?;
+        let label: SharedString = caption.into();
+        let glyph = if warning {
+            div()
+                .size(px(5.0))
+                .rounded_full()
+                .bg(theme.warning)
+                .into_any_element()
+        } else {
+            loaders::mini_mono_spinner(
+                "connection-spinner",
+                2.0,
+                theme.text_muted,
+                self.sidebar_pane.entity_id(),
+                cx,
+            )
+            .into_any_element()
         };
         Some(
             crate::motion::fade_in(
@@ -12690,9 +12659,11 @@ impl Shell {
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                     let chat_id = match surface {
+                        // A pending fork has no chat to act on yet.
                         RightSurface::SideChat(id) => this
                             .side_chats
                             .get(&id)
+                            .filter(|tab| tab.fork.is_none())
                             .and_then(|tab| tab.state.read(cx).selected_chat.clone())
                             .unwrap_or_default(),
                         _ => String::new(),
@@ -14489,48 +14460,50 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_sync_status_waits_for_grace_or_queued_changes() {
-        use zeron_proto::{ChatConnectivity, ChatSyncState as S};
+    fn connection_pill_is_global_only() {
+        use zeron_proto::{ChatConnectivity, ChatSyncState as S, Connectivity, ConnectivityState};
 
-        let mut chat = ChatConnectivity {
-            chat_id: "remote".into(),
-            sync_state: S::Local,
+        let chat = |chat_id: &str, sync_state| ChatConnectivity {
+            chat_id: chat_id.into(),
+            sync_state,
             connected: false,
             delivery_live: false,
-            pending_pushes: 0,
+            pending_pushes: 3,
         };
-        assert_eq!(chat_sync_pill_caption(&chat), None);
-
-        for state in [S::Waiting, S::Connecting, S::Offline] {
-            chat.sync_state = state;
-            chat.connected = true;
-            assert_eq!(chat_sync_pill_caption(&chat), None, "transient {state:?}");
+        // A slow open or a sustained per-chat stall reads in that chat's own
+        // composer and transcript; the sidebar line stays quiet.
+        let mut conn = Connectivity {
+            state: ConnectivityState::Connected,
+            chats: [S::Waiting, S::Connecting, S::Offline, S::Unknown, S::Local]
+                .into_iter()
+                .enumerate()
+                .map(|(i, state)| chat(&format!("chat-{i}"), state))
+                .collect(),
+            ..Connectivity::default()
+        };
+        assert_eq!(connection_pill_caption(&conn), None);
+        conn.state = ConnectivityState::Disabled;
+        assert_eq!(connection_pill_caption(&conn), None);
+        conn.state = ConnectivityState::Reconnecting;
+        assert_eq!(
+            connection_pill_caption(&conn),
+            Some(("Reconnecting…", false))
+        );
+        conn.state = ConnectivityState::Offline;
+        assert_eq!(
+            connection_pill_caption(&conn),
+            Some(("Offline — sends are saved", true))
+        );
+        // A failed local save outranks the network, whichever chat it hit
+        // (not only the selected one).
+        conn.chats.push(chat("background", S::StorageError));
+        for state in [ConnectivityState::Offline, ConnectivityState::Connected] {
+            conn.state = state;
+            assert_eq!(
+                connection_pill_caption(&conn),
+                Some(("Changes could not be saved", true))
+            );
         }
-
-        chat.sync_state = S::Waiting;
-        chat.connected = false;
-        assert_eq!(
-            chat_sync_pill_caption(&chat),
-            Some("Sync queued — changes are saved")
-        );
-        chat.sync_state = S::Connecting;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
-        chat.sync_state = S::Offline;
-        assert_eq!(
-            chat_sync_pill_caption(&chat),
-            Some("Offline — changes are saved")
-        );
-
-        // Real pending pushes remain visible even with a live room.
-        chat.connected = true;
-        chat.pending_pushes = 1;
-        chat.sync_state = S::Waiting;
-        assert_eq!(
-            chat_sync_pill_caption(&chat),
-            Some("Sync queued — changes are saved")
-        );
-        chat.sync_state = S::Connecting;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
     }
 
     #[test]
@@ -18989,6 +18962,18 @@ impl Shell {
     }
     pub fn fixture_transcript(&self) -> Entity<crate::transcript::Transcript> {
         self.transcript.clone()
+    }
+    /// A session row's click in the sidebar.
+    pub fn fixture_open_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.open_chat(chat_id.to_owned(), cx);
+    }
+    /// A side chat's row under its parent.
+    pub fn fixture_open_side_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.open_child_chat_tab(chat_id, cx);
+    }
+    /// The session card's "Fork chat".
+    pub fn fixture_fork_chat(&mut self, cx: &mut Context<Self>) {
+        self.create_side_chat(cx);
     }
 }
 

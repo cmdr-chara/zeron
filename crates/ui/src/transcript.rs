@@ -80,6 +80,11 @@ fn jump_visibility(was_shown: bool, distance: f32) -> bool {
 const MAX_SAVED_VIEWPORTS: usize = 256;
 /// Bound locally-authored queue ids waiting to become transcript prompts.
 const MAX_PENDING_QUEUED_TURNS: usize = 256;
+
+/// A blank transcript waits this long before showing its loader, so a quick
+/// open never flashes one. An executor timer, not an animation delay:
+/// reduced motion snaps animations, it never skips a wait.
+const LOADER_DELAY: Duration = Duration::from_millis(300);
 /// Text-selection edge scrolling runs only during a drag. A 24 ms cadence is
 /// smooth enough to track text while avoiding a permanent animation-frame loop
 /// on low-end devices.
@@ -3233,6 +3238,12 @@ pub struct Transcript {
     /// only then may the working trailer render — a frozen snapshot must
     /// never spin, whatever its entries claim.
     doc_live: bool,
+    /// Why this blank transcript is still loading (see
+    /// [`AppState::transcript_loading`]). Its loader shows once it has held
+    /// for [`LOADER_DELAY`].
+    loading: Option<crate::state::TranscriptLoading>,
+    loader_shown: bool,
+    loader_delay: Option<Task<()>>,
     /// Memory-only viewport state for primary chats visited in this window.
     /// A transcript instance is shared across tabs, so the active ListState is
     /// reset on every attach and cannot retain these positions by itself.
@@ -3642,7 +3653,10 @@ impl Transcript {
             })
             .ok();
         });
-        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        let observe = cx.observe(&state, |this: &mut Self, _, cx| {
+            this.sync(cx);
+            this.sync_loader(cx);
+        });
         cx.on_release(|this: &mut Self, cx| {
             this.close_diagram_zoom(cx);
             crate::image_media::release_media(this.diagrams.borrow_mut().drain(), cx);
@@ -3682,6 +3696,9 @@ impl Transcript {
             retain_on_deselect: false,
             land_end_pending: doc_override.is_some() && !follow,
             doc_live: doc_override.is_some() && follow,
+            loading: None,
+            loader_shown: false,
+            loader_delay: None,
             doc_override,
             saved_viewports: SavedViewportCache::default(),
             pending_viewport: None,
@@ -3772,7 +3789,91 @@ impl Transcript {
             _text_changes: text_changes,
         };
         this.sync(cx);
+        this.sync_loader(cx);
         this
+    }
+
+    /// Follow [`AppState::transcript_loading`], arming the loader's delay
+    /// when loading begins and dropping it the moment anything shows.
+    fn sync_loader(&mut self, cx: &mut Context<Self>) {
+        // A subagent tab reads a doc its parent's sync never speaks for.
+        let loading = if self.doc_override.is_some() {
+            None
+        } else {
+            self.state
+                .read(cx)
+                .transcript_loading(crate::state::clock_now())
+        };
+        if loading == self.loading {
+            return;
+        }
+        self.loading = loading;
+        if loading.is_none() {
+            self.loader_delay = None;
+            if std::mem::take(&mut self.loader_shown) {
+                cx.notify();
+            }
+        } else if self.loader_shown {
+            cx.notify(); // its caption changed
+        } else if self.loader_delay.is_none() {
+            self.loader_delay = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(LOADER_DELAY).await;
+                this.update(cx, |this, cx| {
+                    this.loader_delay = None;
+                    if this.loading.is_some() {
+                        this.loader_shown = true;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
+    }
+
+    /// Centered over the blank list: the zeron loader and what it waits on.
+    fn render_loader(
+        &self,
+        loading: crate::state::TranscriptLoading,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::state::TranscriptLoading as L;
+        let theme = Theme::of(cx).clone();
+        let caption = match loading {
+            L::Opening => "Opening…",
+            L::Syncing => "Syncing…",
+            L::Reconnecting => "Reconnecting…",
+            L::Offline => "Offline — this chat loads when you're back online",
+        };
+        // The overlay is positioned by a still wrapper: `fade_in` restyles
+        // its element `relative` every frame, which would drop it into the
+        // flow below the full-height list, where the pane clips it.
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(motion::fade_in(
+                "transcript-loader",
+                div()
+                    .debug_selector(|| "transcript-loader".into())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(crate::loaders::ring_spinner(
+                        "transcript-loader",
+                        20.0,
+                        theme.text_muted,
+                    ))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(caption)),
+                    ),
+            ))
+            .into_any_element()
     }
 
     // ---- rail plumbing (rendering lives in crate::rail) ----
@@ -7338,11 +7439,13 @@ impl Transcript {
                         let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
                         let send_started = state.pending_send_started(&chat_id, now);
                         let sending = sending_bridge(send_started, turn_started);
-                        // Degraded delivery path: the send is a durable local write
-                        // waiting on connectivity — say so instead of faking
-                        // progress. (The overlay holds while degraded, so this line
-                        // owns the surface until the ack or the failed state.)
-                        let queued = sending && state.chat_delivery_degraded(&chat_id);
+                        // A path that would hold the send: it is a durable local
+                        // write waiting on connectivity — say so instead of faking
+                        // progress. A syncing chat still delivers. (The overlay
+                        // holds while delivery is unconfirmed, so this line owns
+                        // the surface until the ack or the failed state.)
+                        let queued =
+                            sending && state.chat_link_at(&chat_id, now).send_would_queue();
                         let elapsed = turn_started
                             .map(|t| now.signed_duration_since(t).num_seconds().max(0))
                             .unwrap_or(0);
@@ -8885,11 +8988,21 @@ pub struct AgentSender {
 /// agent sent: the agent keeps reading it in the stored prompt, while the
 /// transcript shows the sender above the bubble and only the body inside it.
 fn agent_message_sender(text: &str) -> Option<(AgentSender, &str)> {
-    let (sender, body) = zeron_proto::agent_messages::agent_message_sender(text)?;
+    let rest = text.strip_prefix("[Message from Zeron chat ")?;
+    let (header, body) = rest.split_once("]\n\n")?;
+    let (label, id) =
+        header.rsplit_once(". Reply to it with the Zeron `send_message` tool, chat ")?;
+    let id = id.strip_suffix('.')?;
+    // The label is `Title (short-id)`, or the short id alone when untitled.
+    let title = label
+        .strip_suffix(')')
+        .and_then(|label| label.rsplit_once(" ("))
+        .filter(|(_, short)| !short.is_empty() && id.starts_with(short))
+        .map_or(label, |(title, _)| title);
     Some((
         AgentSender {
-            chat_id: sender.chat_id.into(),
-            title: sender.title.into(),
+            chat_id: id.to_owned().into(),
+            title: single_line(title).into(),
         },
         body,
     ))
@@ -10683,6 +10796,12 @@ impl Render for Transcript {
             .child(content)
             .child(rail);
         let root = root.children(self.render_image_menu(cx));
+        let loader = self
+            .loader_shown
+            .then_some(self.loading)
+            .flatten()
+            .map(|loading| self.render_loader(loading, cx));
+        let root = root.children(loader);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {
@@ -16603,6 +16722,231 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, false, &mut parse).is_empty());
+    }
+
+    /// The engine end of a test state: requests are kept, never answered,
+    /// so whatever is selected stays as unreplayed as on a slow link.
+    type SilentEngine = (
+        tokio::sync::mpsc::Receiver<String>,
+        tokio::sync::mpsc::Sender<String>,
+    );
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Remote chats "a" and "b" on omarchy, under reduced motion. Call
+    /// inside the test runtime.
+    fn remote_chats_state(
+        cx: &mut gpui::TestAppContext,
+        dir: &std::path::Path,
+    ) -> (Entity<AppState>, SilentEngine) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir, cx);
+            crate::motion::set_reduced_motion(cx, true);
+        });
+        let (out, requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+        let engine =
+            crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound));
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.chats = ["a", "b"]
+                .into_iter()
+                .map(|id| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": id, "deviceId": "omarchy", "archived": false,
+                        "createdAt": chrono::Utc::now(),
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            state.set_test_engine(engine);
+            state
+        });
+        (state, (requests, replies))
+    }
+
+    fn user_message(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::User,
+            parts: Vec::new(),
+            created_at: 0,
+            device_id: "omarchy".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        }
+    }
+
+    fn advance(cx: &mut gpui::TestAppContext, by: Duration) {
+        cx.executor().advance_clock(by);
+        cx.run_until_parked();
+    }
+
+    /// Reduced motion snaps animations, never waits: a quick open must not
+    /// flash the loader either way, and a slow one must still get it.
+    #[gpui::test]
+    fn transcript_loader_waits_its_delay_under_reduced_motion(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _engine) = remote_chats_state(cx, dir.path());
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        state.update(cx, |state, cx| state.select_chat(Some("a".into()), cx));
+        cx.run_until_parked();
+        let loader = |cx: &mut gpui::TestAppContext| {
+            transcript.read_with(cx, |this, _| {
+                this.loader_shown.then_some(this.loading).flatten()
+            })
+        };
+        assert_eq!(loader(cx), None);
+        advance(cx, LOADER_DELAY - Duration::from_millis(1));
+        assert_eq!(loader(cx), None, "too quick to flash a loader");
+        advance(cx, Duration::from_millis(1));
+        assert_eq!(loader(cx), Some(crate::state::TranscriptLoading::Opening));
+        // Replayed empty: a remote copy is not known empty until synced.
+        state.update(cx, |state, cx| {
+            state.transcript_replayed = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(loader(cx), Some(crate::state::TranscriptLoading::Syncing));
+        // Content arrives: the loader leaves at once.
+        state.update(cx, |state, cx| {
+            state.transcript = vec![user_message("m1")];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(loader(cx), None);
+        assert!(transcript.read_with(cx, |this, _| this.loader_delay.is_none()));
+    }
+
+    /// The loader overlays the pane it loads, centered in it — not laid out
+    /// below the full-height list, where the pane clips it.
+    #[gpui::test]
+    fn transcript_loader_renders_centered_in_its_pane(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _engine) = remote_chats_state(cx, dir.path());
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        state.update(cx, |state, cx| state.select_chat(Some("a".into()), cx));
+        cx.run_until_parked();
+        advance(cx, LOADER_DELAY);
+        assert!(transcript.read_with(cx, |this, _| this.loader_shown));
+        struct Pane(Entity<Transcript>);
+        impl Render for Pane {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .debug_selector(|| "transcript-pane".into())
+                    .w(px(800.0))
+                    .h(px(600.0))
+                    .child(self.0.clone())
+            }
+        }
+        let (_pane, window) = cx.add_window_view(|_, _| Pane(transcript.clone()));
+        window.update(|window, cx| window.draw(cx).clear());
+        let pane = window.debug_bounds("transcript-pane").unwrap();
+        let loader = window
+            .debug_bounds("transcript-loader")
+            .expect("the loader renders");
+        assert!(
+            loader.top() >= pane.top()
+                && loader.bottom() <= pane.bottom()
+                && loader.left() >= pane.left()
+                && loader.right() <= pane.right(),
+            "the loader lies inside its pane: {loader:?} in {pane:?}"
+        );
+        assert!(
+            f32::from(loader.center().y - pane.center().y).abs() < 1.0,
+            "the loader is centered: {loader:?} in {pane:?}"
+        );
+    }
+
+    /// Leaving a chat caches its transcript; coming back shows it at once,
+    /// so the revisit never reads as loading.
+    #[gpui::test]
+    fn cached_revisit_never_shows_the_loader(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _engine) = remote_chats_state(cx, dir.path());
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        state.update(cx, |state, cx| {
+            state.select_chat(Some("a".into()), cx);
+            state.transcript = vec![user_message("m1")];
+            state.transcript_replayed = true;
+        });
+        // A slow first open of "b" shows its loader…
+        state.update(cx, |state, cx| state.select_chat(Some("b".into()), cx));
+        cx.run_until_parked();
+        advance(cx, LOADER_DELAY);
+        assert!(transcript.read_with(cx, |this, _| this.loader_shown));
+        // …and returning to "a" drops it in the same frame.
+        state.update(cx, |state, cx| state.select_chat(Some("a".into()), cx));
+        cx.run_until_parked();
+        assert!(state.read_with(cx, |state, _| !state.transcript.is_empty()));
+        assert!(transcript.read_with(cx, |this, _| !this.loader_shown && this.loading.is_none()));
+        advance(cx, Duration::from_secs(5));
+        assert!(transcript.read_with(cx, |this, _| !this.loader_shown));
+    }
+
+    /// A subagent tab reads its own doc: the selected conversation's
+    /// opening never puts a loader over it.
+    #[gpui::test]
+    fn subagent_tab_never_shows_the_conversation_loader(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _engine) = remote_chats_state(cx, dir.path());
+        state.update(cx, |state, cx| state.select_chat(Some("a".into()), cx));
+        let subagent =
+            cx.new(|cx| Transcript::for_doc(state.clone(), "subagent-doc".into(), true, cx));
+        let primary = cx.new(|cx| Transcript::new(state.clone(), cx));
+        cx.run_until_parked();
+        advance(cx, Duration::from_secs(1));
+        assert!(primary.read_with(cx, |this, _| this.loader_shown));
+        assert!(subagent.read_with(cx, |this, _| !this.loader_shown && this.loading.is_none()));
+    }
+
+    /// A side chat tab is a transcript over its own state: a never-synced
+    /// remote side chat gets the same loader; an unsaved one has nothing to
+    /// load.
+    #[gpui::test]
+    fn side_chat_on_a_never_synced_remote_chat_shows_the_loader(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, _engine) = remote_chats_state(cx, dir.path());
+        let side_chat = |id: &str| -> zeron_proto::Chat {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "parentChatId": "a", "deviceId": "omarchy",
+                "archived": false, "createdAt": chrono::Utc::now(),
+            }))
+            .unwrap()
+        };
+        let side = cx.new(|cx| AppState::side_chat_state(&parent, side_chat("side"), false, cx));
+        let unsaved = cx.new(|cx| AppState::side_chat_state(&parent, side_chat("new"), true, cx));
+        let side_transcript = cx.new(|cx| Transcript::new(side.clone(), cx));
+        let unsaved_transcript = cx.new(|cx| Transcript::new(unsaved.clone(), cx));
+        cx.run_until_parked();
+        advance(cx, LOADER_DELAY);
+        assert_eq!(
+            side_transcript.read_with(cx, |this, _| this
+                .loader_shown
+                .then_some(this.loading)
+                .flatten()),
+            Some(crate::state::TranscriptLoading::Opening)
+        );
+        assert!(unsaved_transcript.read_with(cx, |this, _| !this.loader_shown));
     }
 }
 

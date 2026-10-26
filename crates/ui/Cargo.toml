@@ -49,6 +49,10 @@ name = "tool-images-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "remote-sync-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "pull-request-fixture"
 required-features = ["pull-request-fixture"]
 
