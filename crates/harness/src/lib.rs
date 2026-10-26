@@ -301,6 +301,7 @@ pub mod agent_ports;
 pub mod cursor;
 pub(crate) mod executable;
 pub mod install;
+pub(crate) mod jsonl_tail;
 pub(crate) mod jsonrpc;
 pub(crate) mod lossy_lines;
 pub mod mock;

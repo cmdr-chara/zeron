@@ -45,6 +45,7 @@
 
 pub mod catalog;
 mod discovery;
+mod fork_tail;
 mod normalize;
 pub mod refresh_lock;
 mod wire;
@@ -69,6 +70,7 @@ use crate::process::owned::Child;
 use crate::process::{ChildStdin, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{apply_ultrathink, to_effort};
+use fork_tail::ForkTail;
 use normalize::{Normalizer, Transcript};
 use wire::{ControlRequestFrame, Frame, allow_response, control_error_line, control_response_line};
 
@@ -335,6 +337,18 @@ impl ClaudeHarness {
         // tools it started; and no inherited Claude Code session markers.
         crate::process::owned::configure(&mut cmd);
         crate::compose_child_path(&mut cmd, exe);
+        // Without it, a foreground subagent's (or forked skill's) text and
+        // thinking never reach the stream, and its tab shows tool calls only.
+        // The variable rather than `--forward-subagent-text`: a CLI older
+        // than 2.1.211 ignores it, but exits on an unknown flag. A `claude`
+        // the run starts in turn inherits it. Outside stream-json print
+        // mode the CLI ignores it "so that nested invocations keep working
+        // when it's set process-wide"
+        // (https://code.claude.com/docs/en/env-vars). A nested stream-json
+        // `claude` (an Agent SDK script, `claude -p --output-format
+        // stream-json`) forwards its own subagents' text too, which only
+        // adds tagged frames to its stream.
+        cmd.env("CLAUDE_CODE_FORWARD_SUBAGENT_TEXT", "1");
         // Host-resolved environment (a Cloud device's `ANTHROPIC_API_KEY`
         // from the user's own key, `GH_TOKEN`, …). Never a Claude.ai
         // subscription token: those stay inside the CLI's own login.
@@ -1142,6 +1156,9 @@ async fn run_session(session: Session) {
     // [`crate::shutdown_agent`]).
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut torn_down: Vec<crate::process::Tracked> = Vec::new();
+    // The typed fork whose transcript is read off disk (see [`fork_tail`]).
+    let claude_root = config_root(&launched.env);
+    let mut tail: Option<ForkTail> = None;
 
     'main: loop {
         if std::mem::take(&mut relaunch) {
@@ -1184,6 +1201,15 @@ async fn run_session(session: Session) {
             }
         }
         let control_deadline = pending_controls.values().map(|(_, _, at)| *at).min();
+        match norm.fork_to_follow() {
+            Some(fork) if tail.as_ref().is_none_or(|t| t.chip != fork.0) => {
+                tail = Some(ForkTail::new(&claude_root, fork));
+            }
+            Some(_) => {}
+            None => tail = None,
+        }
+        let tail_at = tail.as_ref().and_then(ForkTail::next_read);
+        let tail_reading = tail.as_ref().is_some_and(ForkTail::is_reading);
         tokio::select! {
             line = stdout_lines.next_line() => match line {
                 Ok(Some(line)) => {
@@ -1410,6 +1436,24 @@ async fn run_session(session: Session) {
                 }
             },
 
+            // Disk work never occupies this loop: stdout, Stop and steering
+            // keep flowing even when the transcript is on slow storage.
+            _ = tokio::time::sleep_until(tail_at.unwrap_or_else(tokio::time::Instant::now)),
+                if tail_at.is_some() => {
+                if let Some(tail) = tail.as_mut() {
+                    tail.start_read();
+                }
+            },
+
+            records = async { tail.as_mut().expect("read in flight").read_done().await },
+                if tail_reading => {
+                for ev in records.into_iter().flat_map(|record| norm.fork_record(record)) {
+                    if event_tx.send(Ok(ev)).await.is_err() {
+                        break 'main;
+                    }
+                }
+            },
+
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     // A message of ours now owns whatever result comes next.
@@ -1496,9 +1540,19 @@ async fn run_session(session: Session) {
                         error: None,
                         session_id: norm.session_id.clone(),
                     });
+                    // No result came to settle a typed fork: it ends here,
+                    // with the turn, or its chip runs on in the parked run.
+                    for ev in norm.settle_typed_fork(DoneStatus::Interrupted) {
+                        if event_tx.send(Ok(ev)).await.is_err() {
+                            break 'main;
+                        }
+                    }
                     if event_tx.send(Ok(done)).await.is_err() {
                         break 'main;
                     }
+                    // The turn's tools ended with it, as on a normalized
+                    // Done: none may hold the next message back (`next`).
+                    open_tools.clear();
                     turn_open = false;
                     stop_done_at = Some(tokio::time::Instant::now());
                     active_since_stop = false;
@@ -1922,6 +1976,32 @@ mod tests {
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
         // Original input is preserved alongside the answers.
         assert!(updated["questions"].is_array());
+    }
+
+    #[test]
+    fn runs_ask_the_cli_to_forward_subagent_text() {
+        let request = RunRequest {
+            mcp: None,
+            prompt: "hi".into(),
+            harness: None,
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            attachments: Vec::new(),
+            worktree: None,
+            resume: None,
+            env: Default::default(),
+        };
+        let mut cmd = ClaudeHarness::build_command(std::path::Path::new("claude"), &request, false);
+        let value = cmd
+            .as_std_mut()
+            .get_envs()
+            .find(|(key, _)| *key == "CLAUDE_CODE_FORWARD_SUBAGENT_TEXT")
+            .and_then(|(_, value)| value.map(|v| v.to_os_string()));
+        assert_eq!(value.as_deref(), Some(std::ffi::OsStr::new("1")));
     }
 }
 
